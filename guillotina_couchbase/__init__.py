@@ -12,3 +12,4 @@ def includeme(root):
     """
     configure.scan('guillotina_couchbase.api')
     configure.scan('guillotina_couchbase.storage')
+    configure.scan('guillotina_couchbase.catalog')

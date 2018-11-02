@@ -1,12 +1,17 @@
 import base64
 import logging
 import os
-import uuid
 
 import couchbase.exceptions
 import couchbase.experimental
+import couchbase.subdocument as SD
+import guillotina.directives
 from couchbase.n1ql import N1QLQuery
 from guillotina import configure
+from guillotina.catalog import index
+from guillotina.component import get_utilities_for
+from guillotina.content import (IResourceFactory,
+                                get_all_possible_schemas_for_type)
 from guillotina.db import ROOT_ID
 from guillotina.db.storages.base import BaseStorage
 from guillotina.factory.content import Database
@@ -32,6 +37,26 @@ async def CouchbaseDatabaseConfigurationFactory(key, dbconfig, loop=None):
     return db
 
 
+def get_index_fields():
+
+    schemas = []
+    for name, _ in get_utilities_for(IResourceFactory):
+        # For each type
+        for schema in get_all_possible_schemas_for_type(name):
+            schemas.append(schema)
+    schemas = set(schemas)
+
+    fields = []
+    for schema in schemas:
+        index_fields = guillotina.directives.merged_tagged_value_dict(
+            schema, guillotina.directives.index.key)
+        for field_name, catalog_info in index_fields.items():
+            index_name = catalog_info.get('index_name', field_name)
+            if index_name not in fields:
+                fields.append(index_name)
+    return fields
+
+
 @implementer(ICouchbaseStorage)
 class CouchbaseStorage(BaseStorage):
     """
@@ -44,7 +69,8 @@ class CouchbaseStorage(BaseStorage):
     _indexes_fields = (
         'zoid', 'id', 'part', 'resource', 'of',
         'parent_id', 'type', 'otid', 'tid')
-    _create_statement = 'CREATE INDEX {bucket}_object_{field} ON `{bucket}`({field})'  # noqa
+    _create_statement = 'CREATE INDEX {bucket}_object_{index_name} ON `{bucket}`(`{field}`)'  # noqa
+    _counter_doc_id = '__g_txn_counter'
 
     def __init__(self, read_only=False, dsn=None, username=None,
                  password=None, bucket=None, **kwargs):
@@ -54,6 +80,10 @@ class CouchbaseStorage(BaseStorage):
         self._bucket = bucket
         self._cb = None
         super().__init__(read_only)
+
+    @property
+    def bucket(self):
+        return self._cb
 
     async def finalize(self):
         pass
@@ -78,7 +108,11 @@ class CouchbaseStorage(BaseStorage):
                 installed_indexes.append(
                     row['indexes']['index_key'][0].strip('`'))
 
+        if len(installed_indexes) == 0:
+            logger.info('Initializing bucket, can take some time')
+
         if not primary_installed:
+            logger.warning('Creating primary index')
             async for row in self._cb.n1ql_query(  # noqa
                     'CREATE PRIMARY INDEX ON {bucket}'.format(
                         bucket=self._bucket)):
@@ -88,7 +122,19 @@ class CouchbaseStorage(BaseStorage):
             if field in installed_indexes:
                 continue
             statement = self._create_statement.format(
-                bucket=self._bucket, field=field)
+                bucket=self._bucket, index_name=field, field_name=field)
+            logger.warning('Creating index {}'.format(statement))
+            async for row in self._cb.n1ql_query(  # noqa
+                    statement.format(bucket=self._bucket)):
+                pass
+
+        for field in get_index_fields():
+            if 'json.{}'.format(field) in installed_indexes:
+                continue
+            statement = self._create_statement.format(
+                bucket=self._bucket,
+                field='json.' + field, index_name='json_' + field)
+            logger.warning('Creating index {}'.format(statement))
             async for row in self._cb.n1ql_query(  # noqa
                     statement.format(bucket=self._bucket)):
                 pass
@@ -111,7 +157,9 @@ class CouchbaseStorage(BaseStorage):
 
     async def get_next_tid(self, txn):
         if txn._tid is None:
-            txn._tid = str(uuid.uuid4())
+            result = await self._cb.counter(
+                self._counter_doc_id, 1, 1)
+            txn._tid = result.value
         return txn._tid
 
     async def load(self, txn, oid):
@@ -128,37 +176,62 @@ class CouchbaseStorage(BaseStorage):
 
     def get_txn(self, txn):
         if not getattr(txn, '_db_txn', None):
-            txn._db_txn = {
-                'added': {},
-                'removed': []
-            }
+            txn._db_txn = self
         return txn._db_txn
 
     async def store(self, oid, old_serial, writer, obj, txn):
         p = writer.serialize()  # This calls __getstate__ of obj
-        json = await writer.get_json()
         part = writer.part
         if part is None:
             part = 0
 
-        await self._cb.upsert(oid, {
-            'tid': await self.get_next_tid(txn),
-            'zoid': oid,
-            'size': len(p),
-            'part': part,
-            'resource': writer.resource,
-            'of': writer.of,
-            'otid': old_serial,
-            'parent_id': writer.parent_id,
-            'id': writer.id,
-            'type': writer.type,
-            'json': json,
-            'state': base64.b64encode(p).decode('ascii')
-        })
+        json_data = {}
+        future = index.get_future()
+        if not obj.__new_marker__ and obj._p_serial is not None:
+            # we should be confident this is an object update
+            if future is not None and oid in future.update:
+                json_data = future.update[oid]
+            # only indexing updates
+            await self._cb.mutate_in(
+                oid,
+                SD.upsert('tid', await self.get_next_tid(txn)),
+                SD.upsert('size', len(p)),
+                SD.upsert('part', part),
+                SD.upsert('of', writer.of),
+                SD.upsert('otid', old_serial),
+                SD.upsert('parent_id', writer.parent_id),
+                SD.upsert('id', writer.id),
+                SD.upsert('type', writer.type),
+                SD.upsert('state', base64.b64encode(p).decode('ascii'))
+            )
+        else:
+            if future is not None:
+                if oid in future.update:
+                    json_data = future.update[oid]
+                elif oid in future.index:
+                    json_data = future.index[oid]
+                else:
+                    json_data = await writer.get_json()
+            else:
+                json_data = await writer.get_json()
+            await self._cb.upsert(oid, {
+                'tid': await self.get_next_tid(txn),
+                'zoid': oid,
+                'size': len(p),
+                'part': part,
+                'resource': writer.resource,
+                'of': writer.of,
+                'otid': old_serial,
+                'parent_id': writer.parent_id,
+                'id': writer.id,
+                'type': writer.type,
+                'json': json_data,
+                'state': base64.b64encode(p).decode('ascii')
+            })
         return 0, len(p)
 
     async def delete(self, txn, oid):
-        await self._cb.delete(oid)
+        await self._cb.remove(oid, quiet=True)
 
     async def commit(self, transaction):
         return await self.get_next_tid(transaction)
